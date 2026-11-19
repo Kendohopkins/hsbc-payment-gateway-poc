@@ -14,26 +14,32 @@ package com.example.demo;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileReader;
 import java.io.InputStreamReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.Random;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
 /*
  * ⚠️ TRAINING CODE — INTENTIONALLY VULNERABLE. DO NOT DEPLOY.
  * Used to demonstrate SonarQube bugs, vulnerabilities, security hotspots and code smells.
  *
- * VULN 2 (SQL injection) has been FIXED. The remaining issues are left in place.
+ * FIXED: VULN 2 (SQL injection), VULN 3 (command injection), VULN 4 (path traversal).
+ * The remaining issues are left in place.
  */
 @SpringBootApplication
 public class DemoApplication {
@@ -53,9 +59,12 @@ public class DemoApplication {
 	@RestController
 	static class VulnerableController {
 
-		// FIXED (was VULN 2): user input is now bound as a parameter instead of being
-		// concatenated into the SQL, and all JDBC resources are closed automatically
-		// via try-with-resources (also fixes the S2095 resource leak).
+		// Allow-list for hostnames / IPv4 addresses: letters, digits, dots and hyphens,
+		// and it cannot start with "-", so the value can never be read as a ping option.
+		private static final Pattern HOST_PATTERN =
+				Pattern.compile("^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$");
+
+		// FIXED (was VULN 2): parameterized query + try-with-resources.
 		@GetMapping("/user")
 		public String getUser(@RequestParam String name) throws Exception {
 			String sql = "SELECT email FROM users WHERE name = ?";
@@ -68,19 +77,48 @@ public class DemoApplication {
 			}
 		}
 
-		// VULN 3: OS command injection (S2076 / hotspot S4721)
+		// FIXED (was VULN 3): the host is validated against an allow-list and passed to
+		// ProcessBuilder as a separate argument, so no shell is involved and characters
+		// like ";", "|" or "&&" cannot start another command. Reader is now closed too.
 		@GetMapping("/ping")
 		public String ping(@RequestParam String host) throws Exception {
-			Process p = Runtime.getRuntime().exec("ping -c 1 " + host);
-			BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-			return reader.readLine();
+			if (!HOST_PATTERN.matcher(host).matches()) {
+				throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid host");
+			}
+			Process p = new ProcessBuilder("ping", "-c", "1", "-W", "2", host)
+					.redirectErrorStream(true)
+					.start();
+			try (BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+				String line = reader.readLine();
+				if (!p.waitFor(5, TimeUnit.SECONDS)) {
+					p.destroyForcibly();
+				}
+				return line;
+			} finally {
+				p.destroy();
+			}
 		}
 
-		// VULN 4: Path traversal, e.g. ?file=../../etc/passwd (S2083)
+		// FIXED (was VULN 4): the requested path is resolved against the base directory,
+		// normalized, and rejected unless the real path (symlinks resolved) is still
+		// inside that directory. Absolute paths and "../" sequences are therefore refused.
 		@GetMapping("/read")
 		public String readFile(@RequestParam String file) throws Exception {
-			BufferedReader br = new BufferedReader(new FileReader(new File("/app/files/" + file)));
-			return br.readLine();
+			Path baseDir = Paths.get("/app/files").toRealPath();
+			Path target = baseDir.resolve(file).normalize();
+			if (!target.startsWith(baseDir)) {
+				throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid file path");
+			}
+			if (!Files.isRegularFile(target)) {
+				throw new ResponseStatusException(HttpStatus.NOT_FOUND, "File not found");
+			}
+			if (!target.toRealPath().startsWith(baseDir)) {
+				throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid file path");
+			}
+			try (BufferedReader br = Files.newBufferedReader(target)) {
+				String line = br.readLine();
+				return line != null ? line : "";
+			}
 		}
 
 		// VULN 5: Weak hashing algorithm, MD5 (S4790)
