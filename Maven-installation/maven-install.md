@@ -50,7 +50,7 @@ sudo yum install git -y
 ### Project Preparation
 7. Create the `.m2` directory in the home directory of your current user
     ```
-    mkdir ~/.m2
+  mkdir ~/.m2
     ```
 
 8. Create the Settings file inside of the `~/.m2` directory
